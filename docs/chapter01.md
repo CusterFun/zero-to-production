@@ -6,16 +6,16 @@
 
 ## Faster Linking
 
-A sizeable chunk of time is spent in the [Linking phase](https://en.wikipedia.org/wiki/Linker_(computing)) - assembling the actual binary given the outputs of the earlier compilation stages.
+A sizeable chunk of time is spent in the [Linking phase](<https://en.wikipedia.org/wiki/Linker_(computing)>) - assembling the actual binary given the outputs of the earlier compilation stages.
 
-The default linker does a good job, but there are faster alternatives depending on the operating system you are using: 
+The default linker does a good job, but there are faster alternatives depending on the operating system you are using:
 
-- lld on Windows and Linux, a linker developed by the LLVM project; 
-- zld on MacOS. 
+- lld on Windows and Linux, a linker developed by the LLVM project;
+- zld on MacOS.
 
 To speed up the linking phase you have to install the alternative linker on your machine and add this configuration file to the project:
 
-```toml
+````toml
 # .cargo/config.toml
 # On Windows
 # ```
@@ -36,7 +36,7 @@ rustflags = ["-C", "linker=clang", "-C", "link-arg=-fuse-ld=lld"]
 rustflags = ["-C", "link-arg=-fuse-ld=/usr/local/bin/zld"]
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-fuse-ld=/usr/local/bin/zld"]
-```
+````
 
 There is [ongoing work](https://github.com/rust-lang/rust/issues/39915#issuecomment-618726211) on the Rust compiler to use lld as the default linker where possible - soon enough this custom configuration will not be necessary to achieve higher compilation performance!
 
@@ -46,7 +46,7 @@ There is [ongoing work](https://github.com/rust-lang/rust/issues/39915#issuecomm
 cargo install cargo-watch
 ```
 
-cargo-watch monitors your source code to trigger commands every time a file changes. For example: 
+cargo-watch monitors your source code to trigger commands every time a file changes. For example:
 
 ```shell
 cargo watch -x check
@@ -64,11 +64,11 @@ cargo watch -x check -x text -x run
 
 安装好 rust 工具链，创建了项目，IDE 准备好了，最后一步就是 CI 集成。
 
-CI 的第一步是 
+CI 的第一步是
 
 ### 1.`cargo test`
 
-### 2. Code Coverage 
+### 2. Code Coverage
 
 使用代码覆盖率作为质量检查，测量 Rust 项目的代码覆盖率最简单的方法是通过 `cargo tarpaulin`。
 
@@ -78,7 +78,11 @@ CI 的第一步是
 cargo install cargo-tarpaulin
 ```
 
-运行 `cargo tarpaulin --ignore-tests` 忽略测试函数，计算代码的测试覆盖率，并可以上传覆盖率指标到 codecov 或 coveralls 流行的服务。
+运行以下命令忽略测试函数，计算代码的测试覆盖率，并可以上传覆盖率指标到 codecov 或 coveralls 流行的服务。
+
+```shell
+cargo tarpaulin --ignore-tests
+```
 
 ### 3. linting
 
@@ -106,7 +110,7 @@ cargo clippy -- -D warnings
 
 ### 4. Formatting
 
-安装 
+安装
 
 ```shell
 rustup component add rustfmt
@@ -143,4 +147,134 @@ cargo audit
 ```
 
 添加到 CI 的管道一部分，在每次提交时运行。以保持对项目依赖 crate 的新漏洞的关注。
+
+### 6. 使用 GitHub Actions
+
+https://gist.github.com/LukeMathWalker/5ae1107432ce283310c3e601fac915f3
+
+添加文件夹 `.github/workflows`
+
+```yaml
+# .github/workflows/audit-on-push.yml
+
+name: Security audit
+on:
+  push:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+jobs:
+  security_audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - uses: actions-rs/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+```yaml
+# .github/workflows/general.yml
+name: Rust
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # cargo test
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+
+  # cargo fmt --all -- --check
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: rustfmt
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+  # cargo clippy -- -D warnings
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: clippy
+      - uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB name: Security audit
+on:
+  schedule:
+    - cron: '0 0 * * *'
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - uses: actions-rs/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}_TOKEN }}
+          args: -- -D warnings
+
+  # cargo tarpaulin --ignore-tests
+  coverage:
+    name: Code coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Run cargo-tarpaulin
+        uses: actions-rs/tarpaulin@v0.1
+        with:
+          args: '--ignore-tests'
+```
+
+```yaml
+# .github/workflows/scheduled-audit.yml
+
+name: Security audit
+on:
+  schedule:
+    - cron: '0 0 * * *'
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - uses: actions-rs/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+```
 
