@@ -1959,7 +1959,97 @@ pub use health_check::*;
 pub use subscriptions::*;
 ```
 
-
-
 #### 读取配置文件
+
+使用 `config` 来管理我们的配置文件，需要一个实现了 **serde::Deserialize** trait 的结构体 `Settings`
+
+```rust
+//! src/configuration.rs
+#[derive(serde::Deserialize)]
+pub struct Settings {}
+```
+
+目前我们有两组配置：
+
+- 应用程序的端口，actix-web 在这里监听传入的数据（目前是在 `main.rs` 中硬编码的 8000）
+- 数据库连接参数
+
+```rust
+//! src/configuration.rs
+#[derive(serde::Deserialize)]
+pub struct Settings {
+    pub database: DatabasesSettings,
+    pub application_port: u16,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DatabasesSettings {
+    pub username: String,
+    pub password: String,
+    pub port: u16,
+    pub host: String,
+    pub database_name: String,
+}
+```
+
+现在有了 config 的类型，让我们先在 `Cargo.toml` 中添加 `config` 的依赖
+
+```toml
+#! Cargo.toml
+# [...]
+
+[dependencies]
+config = "0.13"
+# [...]
+```
+
+我们希望在 `configuration.rs` 文件中读取应用程序的配置信息（config@0.11版本）
+
+```rust
+//! src/configuration.rs
+// [...]
+pub fn get_configuration() -> Result<Settings, config::ConfigError> {
+    // Initialise our configuration reader
+    let mut settings = config::Config::default();
+    // Add configuration values from a file named `configuration`.
+    // It will look for any top-level file with an extension
+    // that `config` knows how to parse: yaml, json, etc.
+    settings.merge(config::File::with_name("configuration"))?;
+    // Try to convert the configuration values it read into
+    // our Settings type
+    settings.try_into()
+}
+```
+
+在 `config@0.12` 版本之后 api 接口有较大的改动
+
+```rust
+//! src/configuration.rs
+// [...]
+pub fn get_configuration() -> Result<Settings, config::ConfigError> {
+    let settings = config::Config::builder()
+        .add_source(config::File::with_name("configuration"))
+        .build()?;
+
+    settings.try_deserialize()
+}
+```
+
+让我们修改主函数，在刚开始的时候就读取配置文件
+
+```rust
+//! src/main.rs
+use std::net::TcpListener;
+use zero2prod::{configuration::get_configuration, startup::run};
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    // Panic if we can't read configuratio
+    let configuration = get_configuration().expect("Failed to get configuration");
+    // We have removed the hard-coded `8000` - it's now coming from our settings!
+    let address = format!("127.0.0.1:{}", configuration.application_port);
+    let address = TcpListener::bind(address)?;
+    run(address)?.await
+}
+```
 
