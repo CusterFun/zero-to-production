@@ -1853,5 +1853,113 @@ version = "0.5"
 
 #### 重构目录
 
+为了添加的新功能，避免混乱，重构文件夹结构如下：
 
+```sh
+src/
+    configuration.rs
+    lib.rs
+    main.rs
+    routes/
+        mod.rs
+        health_check.rs
+        subscriptions.rs
+    startup.rs
+```
+
+我们的 `lib.rs` 文件内容修改为
+
+```rust
+//! src/lib.rs
+pub mod configuration;
+pub mod routes;
+pub mod startup;
+```
+
+`startup.rs` 将包含我们的 `run` 函数，`health_check` 放在 `routes/health_check.rs`，`subscribe` 和 `FormData` 放入 `routes/subscriptions.rs`。`configuration.rs` 开始为空。`health_check` 和 `subscibe` 都需要在 `routes/mod.rs` 中重新导出。
+
+```rust
+//! src/routes/mod.rs
+mod health_check;
+mod subscriptions;
+pub use health_check::*;
+pub use subscriptions::*;
+```
+
+还需要使用 `pub` 修改可见性，并对 `main.rs` 和 `tests/health_check.rs` 中的 `use` 语句也需要一些修改。确保`cargo check` 和 `cargo test` 都正常。
+
+```rust
+//! src/lib.rs
+pub mod configuration;
+pub mod routes;
+pub mod startup;
+```
+
+```rust
+//! src/main.rs
+use std::net::TcpListener;
+
+use zero2prod::startup::run;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let address = TcpListener::bind("127.0.0.1:8000")?;
+    run(address)?.await
+}
+```
+
+```rust
+//! src/startup.rs
+use std::net::TcpListener;
+use actix_web::{dev::Server, web, App, HttpServer};
+use crate::routes::{health_check, subscribe};
+
+pub fn run(listener: TcpListener) -> Result<Server, std::io::Error> {
+    let server = HttpServer::new(|| {
+        App::new()
+            .route("/health_check", web::get().to(health_check))
+            .route("/subscriptions", web::post().to(subscribe))
+    })
+    .listen(listener)?
+    .run();
+    // No .await here!
+    Ok(server)
+}
+```
+
+```rust
+//! src/routes/health_check.rs
+use actix_web::HttpResponse;
+
+pub async fn health_check() -> HttpResponse {
+    HttpResponse::Ok().finish()
+}
+```
+
+```rust
+//! src/routes/subscriptions.rs
+use actix_web::{web, HttpResponse};
+
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+pub async fn subscribe(_form: web::Form<FormData>) -> HttpResponse {
+    HttpResponse::Ok().finish()
+}
+```
+
+```rust
+//! src/routes/mod.rs
+mod health_check;
+mod subscriptions;
+pub use health_check::*;
+pub use subscriptions::*;
+```
+
+
+
+#### 读取配置文件
 
