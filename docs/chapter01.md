@@ -227,18 +227,7 @@ jobs:
           components: clippy
       - uses: actions-rs/clippy-check@v1
         with:
-          token: ${{ secrets.GITHUB name: Security audit
-on:
-  schedule:
-    - cron: '0 0 * * *'
-jobs:
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v1
-      - uses: actions-rs/audit-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           args: -- -D warnings
 
   # cargo tarpaulin --ignore-tests
@@ -258,7 +247,7 @@ jobs:
       - name: Run cargo-tarpaulin
         uses: actions-rs/tarpaulin@v0.1
         with:
-          args: '--ignore-tests'
+          args: "--ignore-tests"
 ```
 
 ```yaml

@@ -16,6 +16,24 @@ path = "src/main.rs"
 [dependencies]
 actix-web = "4"
 tokio = {version = "1", features = ["macros", "rt-multi-thread"]}
+# We need the optional `derive` feature to use `serde`'s procedural macros:
+# `#[derive(Serialize)]` and `#[derive(Deserialize)]`.
+# The feature is not enabled by default to avoid pulling in
+# unnecessary dependencies for projects that do not need it.
+serde = {version = "1", features = ["derive"]}
+
+# Using table-like toml syntax to avoid a super-long line!
+[dependencies.sqlx]
+default-features = false
+features = [
+  "runtime-actix-rustls",
+  "macros",
+  "postgres",
+  "uuid",
+  "chrono",
+  "migrate",
+]
+version = "0.5"
 
 [dev-dependencies]
 reqwest = "0.11"
