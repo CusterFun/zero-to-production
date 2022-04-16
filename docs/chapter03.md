@@ -2053,3 +2053,125 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
+添加 `configuration.yaml` 配置文件
+
+```yaml
+# configuration.yaml
+application_port: 8000
+database:
+  host: "127.0.0.1"
+  port: 5432
+  username: "postgres"
+  password: "password"
+  database_name: "newsletter"
+```
+
+运行 `cargo run` 一切正常
+
+#### Connecting To Postgres
+
+`PgConnection::connect` 需要一个连接字符串作为输入，而 `DatabaseSetting` 为我们提供了所有连接参数的字段，让我们添加一个 `connection_string` 方法来返回连接字符串
+
+```rust
+//! src/configuration.rs
+#[derive(serde::Deserialize)]
+pub struct Settings {
+    pub database: DatabasesSettings,
+    pub application_port: u16,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DatabasesSettings {
+    pub username: String,
+    pub password: String,
+    pub port: u16,
+    pub host: String,
+    pub database_name: String,
+}
+
+impl DatabasesSettings {
+    pub fn connection_string(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.username, self.password, self.host, self.port, self.database_name
+        )
+    }
+}
+
+pub fn get_configuration() -> Result<Settings, config::ConfigError> {
+    let settings = config::Config::builder()
+        .add_source(config::File::with_name("configuration"))
+        .build()?;
+
+    settings.try_deserialize()
+}
+```
+
+现在让我们来调整下测试
+
+```rust
+//! tests/health_check.rs
+use sqlx::{Connection, PgConnection};
+use zero2prod::configuration::get_configuration;
+// [...]
+
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_from_data() {
+    // Arrange
+    let app_address = spawn_app();
+    let configuration = get_configuration().expect("Failed to read configuration.");
+    let connection_string = configuration.database.connection_string();
+    // The `Connection` trait MUST be in scope for us to invoke
+    // `PgConnection::connect` - it is not an inherent method of the struct!
+    let connection = PgConnection::connect(&connection_string)
+        .await
+        .expect("Failed to connect to Postgres.");
+    let client = reqwest::Client::new();
+
+    // Act
+    let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
+    let response = client
+        .post(&format!("{}/subscriptions", &app_address))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to execute request.");
+
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+}
+```
+
+运行 `cargo test` 测试成功，这里只是测试是否可以成功连接到 Postgres
+
+#### Test Assertion
+
+现在我们已经可以正常连接到数据库，使用 `sqlx::query!` 宏来进行检查
+
+```rust
+//! tests/health_check.rs
+    // [...]
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_from_data() {
+    // Arrange
+    let app_address = spawn_app();
+    let configuration = ...
+    // [...]
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+
+    let saved = sqlx::query!("SELECT email, name FROM subscriptions",)
+        .fetch_one(&mut connection)
+        .await
+        .expoect("Failed to fetch saved subscription.");
+
+    assert_eq!(saved.email, "ursula_le_guin@gmail.com");
+    assert_eq!(saved.name, "le guin");
+}
+```
+
+
+
+
+
