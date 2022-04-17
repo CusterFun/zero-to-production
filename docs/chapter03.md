@@ -1,4 +1,53 @@
-[toc]
+- [注册邮件订阅](#注册邮件订阅)
+- [前期工作](#前期工作)
+- [添加 GitHub Actions](#添加-github-actions)
+- [`actix-web`](#actix-web)
+- [`/health_check` 接口](#health_check-接口)
+  - [使用 `actix-web`](#使用-actix-web)
+  - [剖析 `actix-web` 应用程序](#剖析-actix-web-应用程序)
+    - [Server - `HttpServer`](#server---httpserver)
+    - [Application - `App`](#application---app)
+    - [Endpoint - Route](#endpoint---route)
+    - [Runtime - tokio](#runtime---tokio)
+- [实现健康检查接口](#实现健康检查接口)
+- [第一个集成测试](#第一个集成测试)
+  - [如何测试一个接口](#如何测试一个接口)
+  - [测试代码放在哪里](#测试代码放在哪里)
+  - [改变项目结构以便测试](#改变项目结构以便测试)
+  - [实现第一个集成测试](#实现第一个集成测试)
+- [修正 Polishing](#修正-polishing)
+  - [Clean Up](#clean-up)
+  - [选择随机端口](#选择随机端口)
+- [完成第一个用户故事](#完成第一个用户故事)
+- [使用 HTML 表单](#使用-html-表单)
+  - [细化需求](#细化需求)
+  - [将需求写成测试](#将需求写成测试)
+  - [解析 POST 请求中的表单数据](#解析-post-请求中的表单数据)
+    - [Extractors](#extractors)
+    - [Form 和 FromRequest](#form-和-fromrequest)
+    - [Rust 中的序列化](#rust-中的序列化)
+    - [Putting Everything Together 综上所述](#putting-everything-together-综上所述)
+- [存储数据：数据库](#存储数据数据库)
+  - [集成测试](#集成测试)
+  - [Database Setup](#database-setup)
+    - [Docker](#docker)
+    - [Database Migrations](#database-migrations)
+  - [写第一个查询语句](#写第一个查询语句)
+    - [配置 `sqlx` 依赖](#配置-sqlx-依赖)
+    - [配置数据库管理](#配置数据库管理)
+    - [重构目录](#重构目录)
+    - [读取配置文件](#读取配置文件)
+    - [Connecting To Postgres](#connecting-to-postgres)
+    - [Test Assertion](#test-assertion)
+    - [Updating CI Pipeline](#updating-ci-pipeline)
+- [存储订阅者信息](#存储订阅者信息)
+  - [`actix-web` 中应用程序的状态](#actix-web-中应用程序的状态)
+  - [`actix-web` Workers 工作原理](#actix-web-workers-工作原理)
+  - [The Data Extractor](#the-data-extractor)
+  - [The INSERT Query](#the-insert-query)
+- [更新测试](#更新测试)
+  - [测试隔离](#测试隔离)
+- [总结](#总结)
 
 ## 注册邮件订阅
 
@@ -2151,12 +2200,12 @@ async fn subscribe_returns_a_200_for_valid_from_data() {
 
 ```rust
 //! tests/health_check.rs
-    // [...]
+// [...]
 #[tokio::test]
 async fn subscribe_returns_a_200_for_valid_from_data() {
-    // Arrange
-    let app_address = spawn_app();
-    let configuration = ...
+    // [...]
+    // The connection has to be marked as mutable!
+    let mut configuration = ...
     // [...]
     // Assert
     assert_eq!(200, response.status().as_u16());
@@ -2171,7 +2220,1197 @@ async fn subscribe_returns_a_200_for_valid_from_data() {
 }
 ```
 
+`saved` 的类型是什么？ `sqlx::query!` 返回一个匿名 **record type**：在编译时验证了查询的有效性之后的一个结构体类型。其成员为结果中的每一列（如：email 列的成员为 saved.email）。`sqlx` 在编译时连接 postgres，以检查查询是否合理，就像 `sqlx-cli` 命令一样，所以需要 `DATABASE_URL` 环境变量知道在哪里找到数据库。我们可以手动导出 `DATABASE_URL`，但是每次启动及其时都会遇到同样的问题，按照 [`sqlx` 作者的建议](https://github.com/launchbadge/sqlx#compile-time-verification)，可以在顶级目录下添加 `.env` 文件
+
+```sh
+DATABASE_URL="postgres://postgres:password@localhost:5432/newsletter"
+```
+
+`sqlx` 将从中读取 `DATABASE_URL`，省去我们每次设置环境变量的麻烦。
+
+把数据库连接参数放在两个地方 (.env 和配置文件 configuration.yaml)，但这不是一个大问题，`configuration.yaml` 是用在应用程序在编译后的运行行为，而 `.env` 只于我们的开发过程有关、构建和测试步骤有关。将 `.env` 文件提交到版本控制中，我们很快就会在 CI 中使用到它。
+
+现在运行 `cargo test` 测试，可以看到正如我们的期望，测试失败。
+
+#### Updating CI Pipeline
+
+我们的测试现在依赖于一个正在运行的Postgres数据库才能正常执行。我们所有的构建命令（cargo check、cargo lint、cargo build），由于sqlx的编译时检查，都需要一个正常运行的数据库！[更新 `general.yaml`]([zero-to-production/general.yml at root-chapter-03-part1 · LukeMathWalker/zero-to-production (github.com)](https://github.com/LukeMathWalker/zero-to-production/blob/root-chapter-03-part1/.github/workflows/general.yml))
+
+```yaml
+name: Rust
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:12
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+    env:
+      SQLX_VERSION: 0.5.5
+      SQLX_FEATURES: postgres
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Cache dependencies
+        id: cache-dependencies
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache sqlx-cli
+        uses: actions/cache@v2
+        id: cache-sqlx
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+          key: ${{ runner.os }}-sqlx-${{ env.SQLX_VERSION }}-${{ env.SQLX_FEATURES }}
+
+      - name: Install sqlx-cli
+        uses: actions-rs/cargo@v1
+        if: steps.cache-sqlx.outputs.cache-hit == false
+        with:
+          command: install
+          args: >
+            sqlx-cli
+            --force
+            --version=${{ env.SQLX_VERSION }}
+            --features=${{ env.SQLX_FEATURES }}
+            --no-default-features
+            --locked
+      - name: Migrate database
+        run: |
+          sudo apt-get install libpq-dev -y
+          SKIP_DOCKER=true ./scripts/init_db.sh
+      - name: Run cargo test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          components: rustfmt
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:12
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+    env:
+      SQLX_VERSION: 0.5.5
+      SQLX_FEATURES: postgres
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          components: clippy
+          toolchain: stable
+          override: true
+
+      - name: Cache sqlx-cli
+        uses: actions/cache@v2
+        id: cache-sqlx
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+          key: ${{ runner.os }}-sqlx-${{ env.SQLX_VERSION }}-${{ env.SQLX_FEATURES }}
+
+      - name: Install sqlx-cli
+        uses: actions-rs/cargo@v1
+        if: steps.cache-sqlx.outputs.cache-hit == false
+        with:
+          command: install
+          args: >
+            sqlx-cli
+            --force
+            --version=${{ env.SQLX_VERSION }}
+            --features=${{ env.SQLX_FEATURES }}
+            --no-default-features
+            --locked
+      - name: Migrate database
+        run: |
+          sudo apt-get install libpq-dev -y
+          SKIP_DOCKER=true ./scripts/init_db.sh
+      - name: Run clippy
+        uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: -- -D warnings
+
+  coverage:
+    name: Code coverage
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:12
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+    env:
+      SQLX_VERSION: 0.5.5
+      SQLX_FEATURES: postgres
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Cache sqlx-cli
+        uses: actions/cache@v2
+        id: cache-sqlx
+        with:
+          path: |
+            ~/.cargo/bin/sqlx
+          key: ${{ runner.os }}-sqlx-${{ env.SQLX_VERSION }}-${{ env.SQLX_FEATURES }}
+
+      - name: Install sqlx-cli
+        uses: actions-rs/cargo@v1
+        if: steps.cache-sqlx.outputs.cache-hit == false
+        with:
+          command: install
+          args: >
+            sqlx-cli
+            --force
+            --version=${{ env.SQLX_VERSION }}
+            --features=${{ env.SQLX_FEATURES }}
+            --no-default-features
+            --locked
+      - name: Migrate database
+        run: |
+          sudo apt-get install libpq-dev -y
+          SKIP_DOCKER=true ./scripts/init_db.sh
+      - name: Run cargo-tarpaulin
+        uses: actions-rs/tarpaulin@v0.1
+        with:
+          args: "--ignore-tests --avoid-cfg-tarpaulin"
+```
+
+## 存储订阅者信息
+
+正如上面的测试中 `SELECT` 查询哪些订阅者被保存到了数据库中一样，当我们收到 `POST /subscriptions` 请求时，需要写一个 `INSERT` 语句来实际存储一个新的订阅者信息。
+
+我们目前的处理请求
+
+```rust
+//! src/routes/subscriptions.rs
+use actix_web::{web, HttpResponse};
+
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+pub async fn subscribe(_form: web::Form<FormData>) -> HttpResponse {
+    HttpResponse::Ok().finish()
+}
+```
+
+为了在 subscribe 中执行数据库操作，我们需要得到一个数据库连接，下面看看如何获取数据库连接
+
+### `actix-web` 中应用程序的状态
+
+到目前为止，我们的应用程序完全是无状态的，我们的处理程序只处理来自传入请求的数据。
+
+`actix-web` 让我们有添加应用程序状态的能力，可以在请求中添加其他数据到应用程序中，在应用程序中使用 [`app_data` method](https://docs.rs/actix-web/4.0.1/actix_web/struct.App.html#method.app_data) 添加 **application state** 
+
+让我们尝试用 `app_data` 来注册一个 `PgConnection`，作为应用程序状态的一部分。我们需要修改 `run` 方法，以便在 **TcpListener** 旁接受一个 **PgConnection**
+
+```rust
+//! src/startup.rs
+use actix_web::{dev::Server, web, App, HttpServer};
+use sqlx::PgConnection;
+use std::net::TcpListener;
+
+use crate::routes::{health_check, subscribe};
+
+pub fn run(listener: TcpListener, connection: PgConnection) -> Result<Server, std::io::Error> {
+    let server = HttpServer::new(|| {
+        App::new()
+            .route("/health_check", web::get().to(health_check))
+            .route("/subscriptions", web::post().to(subscribe))
+            .app_data(connection)
+    })
+    .listen(listener)?
+    .run();
+    Ok(server)
+}
+```
+
+运行 `cargo check` 可以返现错误 `E0277`
+
+```sh
+Checking zero2prod v0.1.0 (D:\Up\zero2prod)
+error[E0277]: the trait bound `PgConnection: Clone` is not satisfied in `[closure@src\startup.rs:12:34: 17:6]`
+  --> src\startup.rs:12:18
+   |
+12 |       let server = HttpServer::new(|| {
+   |  __________________^^^^^^^^^^^^^^^_-
+   | |                  |
+   | |                  within `[closure@src\startup.rs:12:34: 17:6]`, the trait `Clone` is not implemented for `PgConnection`
+13 | |         App::new()
+14 | |             .route("/health_check", web::get().to(health_check))
+15 | |             .route("/subscriptions", web::post().to(subscribe))
+16 | |             .app_data(connection)
+17 | |     })
+   | |_____- within this `[closure@src\startup.rs:12:34: 17:6]`
+   |
+   = note: required because it appears within the type `[closure@src\startup.rs:12:34: 17:6]`
+note: required by a bound in `HttpServer::<F, I, S, B>::new`
+  --> C:\Users\Custer\.cargo\registry\src\mirrors.sjtug.sjtu.edu.cn-7a04d2510079875b\actix-web-4.0.1\src\server.rs:74:27
+   |
+74 |     F: Fn() -> I + Send + Clone + 'static,
+   |                           ^^^^^ required by this bound in `HttpServer::<F, I, S, B>::new`
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `zero2prod` due to previous error
+```
+
+`HttpServer` 期望 `PgConnection` 是可以被 `Clone` 的，但是为什么它首先需要实现 `Clone` 呢？
+
+### `actix-web` Workers 工作原理
+
+让我们先看下 `HttpServer::new` 的方法
+
+```rust
+let server = HttpServer::new(|| {
+    App::new()
+        .route("/health_check", web::get().to(health_check))
+        .route("/subscriptions", web::post().to(subscribe))
+})
+```
+
+`HttpServer::new` 接收一个闭包返回一个 `App` 结构体。这是为了支持 `actix-web` 的运行时模型：`actix-web` 将为你机器上的每个可用内核启用一个工作进程。每个 `worker` 运行它自己的有 `HttpServer` 构建的应用程序副本，调用 `HttpServer::new` 作为参数的闭包。
+
+这就是为什么连接必须是可克隆的原因 -- 因为我们需要使用应用程序的副本。但是  `PgConnection` 没有实现 `Clone`，因为它位于不可克隆的系统资源之上，即带有 `Postgres` 的 `TCP` 连接，那该怎么办呢？
+
+可以使用 [`web::Data`](https://docs.rs/actix-web/4.0.1/actix_web/web/struct.Data.html) 另一个 `actix-web` 提取器
+
+```rust
+#[doc(alias = "state")]
+#[derive(Debug)]
+pub struct Data<T: ?Sized>(Arc<T>);
+```
+
+`web::Data` 将我们的连接包装在一个原子引用计数指针中，一个 `Arc:` 每个应用程序的实例不是获得 `PgConnection` 的原始副本，而是获得一个指向它的指针。无论 T 是谁，`Arc<T>` 总是可以克隆的，克隆一个 `Arc` 会相应的增加存活的引用数量，并传递包装值的内存地址的新副本。然后，处理程序可以使用相同的提取器访问应用程序状态。
+
+```rust
+//! src/startup.rs
+use actix_web::{dev::Server, web, App, HttpServer};
+use sqlx::PgConnection;
+use std::net::TcpListener;
+
+use crate::routes::{health_check, subscribe};
+
+pub fn run(listener: TcpListener, connection: PgConnection) -> Result<Server, std::io::Error> {
+    // Wrap the connection in a smart pointer
+    let connection = web::Data::new(connection);
+    // Capture `connection` from the surrounding environment
+    let server = HttpServer::new(move || {
+        App::new()
+            .route("/health_check", web::get().to(health_check))
+            .route("/subscriptions", web::post().to(subscribe))
+            // Get a pointer copy and attach it to the application state
+            .app_data(connection.clone())
+    })
+    .listen(listener)?
+    .run();
+    Ok(server)
+}
+```
+
+运行 `cargo check` 发现还是报错了 `E0061`
+
+```sh
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> src/main.rs:14:5
+   |
+14 |     run(address)?.await
+   |     ^^^ ------- supplied 1 argument
+   |     |
+   |     expected 2 arguments
+   |
+note: function defined here
+  --> D:\Up\zero2prod\src\startup.rs:11:8
+   |
+11 | pub fn run(listener: TcpListener, connection: PgConnection) -> Result<Server, std::io::Error> {
+   |        ^^^
+
+For more information about this error, try `rustc --explain E0061`.
+```
+
+继续修改
+
+```rust
+//! src/main.rs
+
+use std::net::TcpListener;
+
+use sqlx::{Connection, PgConnection};
+use zero2prod::{configuration::get_configuration, startup::run};
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    // Panic if we can't read configuratio
+    let configuration = get_configuration().expect("Failed to get configuration");
+    let connection = PgConnection::connect(&configuration.database.connection_string())
+        .await
+        .expect("Failed to connect to Postgres.");
+    // We have removed the hard-coded `8000` - it's now coming from our settings!
+    let address = format!("127.0.0.1:{}", configuration.application_port);
+    let address = TcpListener::bind(address)?;
+    run(address, connection)?.await
+}
+```
+
+运行 `cargo check` 一切正常
+
+### The Data Extractor
+
+现在我们可以在请求处理程序 `subscribe` 中使用 `web::Data` 提取器来获得一个 `Arc<PgConnection>`
+
+```rust
+//! src/routes/subscriptions.rs
+use actix_web::{web, HttpResponse};
+use sqlx::PgConnection;
+
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+pub async fn subscribe(
+    _form: web::Form<FormData>,
+    // Retrieving a connection from the application state!
+    _connection: web::Data<PgConnection>,
+) -> HttpResponse {
+    HttpResponse::Ok().finish()
+}
+```
+
+`web::Data` 是如何提取 `PgConnection` 的呢？
+
+`actix-web` 使用 *type-map* 类型映射来表示他的 `application state` 应用状态:  一个 [`HashMap`](https://doc.rust-lang.org/std/collections/struct.HashMap.html) ，它将任意数据（使用 [`Any type`](https://doc.rust-lang.org/std/any/trait.Any.html) 类型） 与他们的唯一类型标识符（通过 [`TypeId::of`](https://doc.rust-lang.org/std/any/struct.TypeId.html) 获得）相对应，进行存储。
+
+`web::Data`，当一个新的请求进来时，计算你在签名中指定的类型的 `TypeId`（在我们的例子中是 `PgConnection`），并检查在 `type-map` 中是否有与之对应的记录。如果有，它将检索到的 `Any` 值强制转换为你指定的类型（`TypeId` 是唯一的，不用担心）并将其传递给你的处理程序。 这是一种有趣的技术，在其他语言生态系统中可能被称为**依赖注入**（*dependency injection*）。
+
+### The INSERT Query 
+
+我们终于在 `subscribe` 中建立了一个连接，让我们尝试持久化新订阅用户的详细信息，我们将再次使用在 `test` 中出现的 `query!` 宏。
+
+```rust
+//! src/routes/subscriptions.rs
+use actix_web::{web, HttpResponse};
+use chrono::Utc;
+use sqlx::PgConnection;
+use uuid::Uuid;
+
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+pub async fn subscribe(
+    form: web::Form<FormData>,
+    connection: web::Data<PgConnection>,
+) -> HttpResponse {
+    sqlx::query!(
+        r#"
+        INSERT INTO subscriptions (id, email, name, subscribed_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+        Uuid::new_v4(),
+        form.email,
+        form.name,
+        Utc::now(),
+    )
+    .execute(connection.get_ref())
+    .await
+    .unwrap();
+    HttpResponse::Ok().finish()
+}
+```
+
+让我们看下上面的代码
+
+- 我们将动态数据绑定到 `INSERT` `query!` 中。`$1` 表示传递给 `query!` 的第一个参数！依次类推， `query!` 在编译时验证所童工的参数数量是否与查询所期望的相匹配，以及他们的类型是否兼容（如：不能将一个数字作为 id 传递）
+- 我们使用 `Uuid::new_v4()` 生成一个随机 id
+- 对于 `subscribe_at` 我们使用 Utc 时区中的当前时间戳
+
+我们还必须向 `Cargo.toml` 中添加新的两个依赖
+
+```toml
+#! Cargo.toml
+# [...]
+
+[dependencies]
+chrono = "0.4"
+uuid = {version = "0.8", features = ["v4"]}
+```
+
+现在运行 `cargo check` 可以看到报错 `E0277`
+
+```sh
+error[E0277]: the trait bound `&PgConnection: Executor<'_>` is not satisfied
+   --> src\routes\subscriptions.rs:27:14
+    |
+27  |     .execute(connection.get_ref())
+    |      ------- ^^^^^^^^^^^^^^^^^^^^ the trait `Executor<'_>` is not implemented for `&PgConnection`
+    |      |
+    |      required by a bound introduced by this call
+    |
+    = help: the following implementations were found:
+              <&'c mut PgConnection as Executor<'c>>
+    = note: `Executor<'_>` is implemented for `&mut sqlx::PgConnection`, but not for `&sqlx::PgConnection`
+note: required by a bound in `sqlx::query::Query::<'q, DB, A>::execute`
+   --> \sqlx-core-0.5.13\src\query.rs:151:12
+    |
+151 |         E: Executor<'c, Database = DB>,
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `sqlx::query::Query::<'q, DB, A>::execute`
+
+For more information about this error, try `rustc --explain E0277`.
+```
+
+`execute` 需要一个实现了 `sqlx` 的 `Executor`trait 的参数，结果是，正如我们应该从我们在测试中写的查 询中记住的那样，`&PgConnection` 没有实现 `Executor` --只有 `&mut PgConnection` 实现了。
+
+为什么会这样呢？
+
+`sqlx` 有一个异步接口，但它不允许你通过同一数据库连接,同时运行多个查询。
+
+要求一个 *mutable reference* 可变引用允许他们在 `API` 中强制执行这一保证。你可以把可变引用看成是一个独占的引用 ：编译器保证他们确实有对该 `PgConnection` 的独占访问权，因为在整个程序中不有两个有效的可变引用同时指向同一个值，相当巧妙。
+
+看起来，我们好像使用错误了，`web::Data` 不会给我们 `application state` 的可变引用。
+
+我们可以利用内部可变性（[*interior mutability*](https://doc.rust-lang.org/book/ch15-05-interior-mutability.html)），将我们的 `PgConnection` 放入锁中，如 [`Mutex`]()，将允许我们同步访问底层的 TCP socket ，并在获得锁后获得对包装连接的可变引用。我们可以让它巩固走，但这并不理想，我们将被限制在一次最多运行一个查询，不是很好。
+
+让我们再看以下 `sqlx`的 [`Executor trait` 的文档](https://docs.rs/sqlx/latest/sqlx/trait.Executor.html)：除了 `&mut PgConnection` 之外还有哪些实现了 `Executor`。找到了对 **[`PgPool`](https://docs.rs/sqlx/latest/sqlx/type.PgPool.html)的共享引用**。
+
+`PgPool` 是一个指向 Postgres 数据库的连接池，它是如何绕过我们刚才讨论的 `PgConnection` 的并发问题的？
+
+仍然有内部可变性在起作用，但是不同的是：当你对一个 `&PgPool` 运行查询时，`sqlx` 将从连接池中借用一个 `PgConnection` 并使用它来执行查询；如果没有可用的连接，它将创建一个新的连接或者等待一个空闲。这增加了我们应用程序可以运行的并发查询的数量，也提高了它的弹性：一个缓慢的查询不会因为在连接锁上产生争夺而影响所有传入请求的性能。
+
+让我们重构 `run`、`main` 和 `subscribe` 函数以使用 `PgPool`，而不是单个的 `PgConnection`
+
+```rust
+//! src/main.rs
+use std::net::TcpListener;
+use sqlx::PgPool;
+use zero2prod::{configuration::get_configuration, startup::run};
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let configuration = get_configuration().expect("Failed to get configuration");
+    let connection_pool = PgPool::connect(&configuration.database.connection_string())
+        .await
+        .expect("Failed to connect to Postgres.");
+    let address = format!("127.0.0.1:{}", configuration.application_port);
+    let address = TcpListener::bind(address)?;
+    run(address, connection_pool)?.await
+}
+```
+
+```rust
+//! src/startup.rs
+use actix_web::{dev::Server, web, App, HttpServer};
+use sqlx::PgPool;
+use std::net::TcpListener;
+
+use crate::routes::{health_check, subscribe};
+
+pub fn run(listener: TcpListener, db_pool: PgPool) -> Result<Server, std::io::Error> {
+    // Wrap the pool using web::Data, which boils down to an Arc smart pointer
+    let db_pool = web::Data::new(db_pool);
+    // Capture `db_pool` from the surrounding environment
+    let server = HttpServer::new(move || {
+        App::new()
+            .route("/health_check", web::get().to(health_check))
+            .route("/subscriptions", web::post().to(subscribe))
+            // Get a pointer copy and attach it to the application state
+            .app_data(db_pool.clone())
+    })
+    .listen(listener)?
+    .run();
+    // No .await here!
+    Ok(server)
+}
+```
+
+```rust
+//! src/routes/subscriptions.rs
+use actix_web::{web, HttpResponse};
+use chrono::Utc;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+pub async fn subscribe(form: web::Form<FormData>, pool: web::Data<PgPool>) -> HttpResponse {
+    sqlx::query!(
+        r#"
+        INSERT INTO subscriptions (id, email, name, subscribed_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+        Uuid::new_v4(),
+        form.email,
+        form.name,
+        Utc::now(),
+    )
+    .execute(pool.get_ref())
+    .await;
+    HttpResponse::Ok().finish()
+}
+```
+
+运行 `cargo check` 会有一个警告 
+
+```sh
+warning: unused `Result` that must be used
+  --> src\routes\subscriptions.rs:14:5
+   |
+14 | /     sqlx::query!(
+15 | |         r#"
+16 | |         INSERT INTO subscriptions (id, email, name, subscribed_at)
+17 | |         VALUES ($1, $2, $3, $4)
+...  |
+24 | |     .execute(pool.get_ref())
+25 | |     .await;
+   | |___________^
+   |
+   = note: `#[warn(unused_must_use)]` on by default
+   = note: this `Result` may be an `Err` variant, which should be handled
+```
+
+`sqlx::query!` 可能会失败，它返回一个 `Result`，这是 Rust 对函数的错误处理的方式。编译器提醒我们处理错误的情况--让我们听从建议。
+
+```rust
+//! src/routes/subscriptions.rs
+use actix_web::{web, HttpResponse};
+use chrono::Utc;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+pub async fn subscribe(form: web::Form<FormData>, pool: web::Data<PgPool>) -> HttpResponse {
+    // `Result` has two variants: `Ok` and `Err`.
+    // The first for successes, the second for failures.
+    // We use a `match` statement to choose what to do based on the outcome.
+    match sqlx::query!(
+        r#"
+        INSERT INTO subscriptions (id, email, name, subscribed_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+        Uuid::new_v4(),
+        form.email,
+        form.name,
+        Utc::now()
+    )
+    .execute(pool.as_ref())
+    .await
+    {
+        Ok(_) => HttpResponse::Ok().finish(),
+        Err(e) => {
+            println!("Failed to execute query {e:?}");
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+```
+
+运行 `cargo check` 一切正常，运行 `cargo test` 发生了错误 `E0061`
+
+```sh
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> tests\health_check.rs:13:18
+   |
+13 |     let server = zero2prod::startup::run(listener).expect("Failed to bind address");
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^ -------- supplied 1 argument
+   |                  |
+   |                  expected 2 arguments
+   |
+note: function defined here
+  --> D:\Up\zero2prod\src\startup.rs:11:8
+   |
+11 | pub fn run(listener: TcpListener, db_pool: PgPool) -> Result<Server, std::io::Error> {
+   |        ^^^
+
+For more information about this error, try `rustc --explain E0061`.
+```
+
+## 更新测试
+
+上面的错误发生在 `spawn_app` 函数中
+
+```rust
+//! tests/health_check.rs
+use zero2prod::startup::run;
+use std::net::TcpListener;
+// [...]
+
+/// Spin up an instance of our application
+/// and returns its address (i.e. http://localhost:XXXX)
+fn spawn_app() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind random port");
+    // We retrieve the port assigned to us by the OS
+    let port = listener.local_addr().unwrap().port();
+    let server = zero2prod::startup::run(listener).expect("Failed to bind address");
+    let _ = tokio::spawn(server);
+    // We return the application address to the caller!
+    format!("http://127.0.0.1:{}", port)
+}
+```
+
+我们需要传入一个连接池来运行，
+
+在 `subscribe_returns_a_200_for_valid_from_data` 中需要相同的连接池。 来执行我们的 `SELECT` 查询，对`spawn_app` 进行泛化是有意义的：我们将给调用者提供一个 `TestApp` 结构体，而不是返回一个原始字符串。`TestApp` 将保存我们的测试应用程序实例的连接地址和数据库连接池句柄，从而简化我们的测试用例中步骤。
+
+```rust
+//! tests/health_check.rs
+
+use sqlx::PgPool;
+use std::net::TcpListener;
+use zero2prod::{configuration::get_configuration, startup::run};
+
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: PgPool,
+}
+
+// The function is asynchronous now!
+async fn spawn_app() -> TestApp {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind random port");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("http://127.0.0.1:{}", port);
+
+    let configuration = get_configuration().expect("Failed to read configuration");
+    let connection_pool = PgPool::connect(&configuration.database.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+
+    let server = run(listener, connection_pool.clone()).expect("Failed to bind address");
+    let _ = tokio::spawn(server);
+    TestApp {
+        address,
+        db_pool: connection_pool,
+    }
+}
+
+// [...]
+```
+
+所有的测试用例都要进行相应的更新
+
+```rust
+//! tests/health_check.rs
+// [...]
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_from_data() {
+    // Arrange
+    let app = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    // Act
+    let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
+    let response = client
+        .post(&format!("{}/subscriptions", &app.address))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to execute request.");
+
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+
+    let saved = sqlx::query!("SELECT email, name FROM subscriptions",)
+        .fetch_one(&app.db_pool)
+        .await
+        .expect("Failed to fetch saved subscription.");
+
+    assert_eq!(saved.email, "ursula_le_guin@gmail.com");
+    assert_eq!(saved.name, "le guin");
+}
+```
+
+可以看到当我们去掉了建立数据库连接的相关代码，测试的意图就更加清晰了。
+
+```rust
+//! tests/health_check.rs
+
+use sqlx::PgPool;
+use std::net::TcpListener;
+use zero2prod::{configuration::get_configuration, startup::run};
+
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: PgPool,
+}
+
+// The function is asynchronous now!
+async fn spawn_app() -> TestApp {
+    let listener = TcpListener::bind("http://127.0.0.1:0").expect("Failed to bind random port");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("127.0.0.1:{}", port);
+
+    let configuration = get_configuration().expect("Failed to read configuration");
+    let connection_pool = PgPool::connect(&configuration.database.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+
+    let server = run(listener, connection_pool.clone()).expect("Failed to bind address");
+    let _ = tokio::spawn(server);
+    TestApp {
+        address,
+        db_pool: connection_pool,
+    }
+}
+
+// `tokio::test` is the testing equivalent of `tokio::main`.
+// It also spares you from having to specify the `#[test]` attribute.
+//
+// You can inspect what code gets generated using
+// `cargo expand --test health_check` (<- name of the test file)
+#[tokio::test]
+async fn health_check_works() {
+    let app = spawn_app().await;
+    // We need to bring in `reqwest`
+    // to perform HTTP requests against our application.
+    let client = reqwest::Client::new();
+    // Act
+    let response = client
+        .get(&format!("{}/health_check", &app.address))
+        .send()
+        .await
+        .expect("Failed to execute request.");
+    // Assert
+    assert!(response.status().is_success());
+    assert_eq!(Some(0), response.content_length());
+}
+
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_from_data() {
+    // Arrange
+    let app = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    // Act
+    let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
+    let response = client
+        .post(&format!("{}/subscriptions", &app.address))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to execute request.");
+
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+
+    let saved = sqlx::query!("SELECT email, name FROM subscriptions",)
+        .fetch_one(&app.db_pool)
+        .await
+        .expect("Failed to fetch saved subscription.");
+
+    assert_eq!(saved.email, "ursula_le_guin@gmail.com");
+    assert_eq!(saved.name, "le guin");
+}
+
+#[tokio::test]
+async fn subscribe_returns_a_400_when_data_is_missing() {
+    // Arrange
+    let app = spawn_app().await;
+    let client = reqwest::Client::new();
+    let test_cases = vec![
+        ("name=le%20guin", "missing the email"),
+        ("email=ursula_le_guin%40gmail.com", "missing the name"),
+        ("", "missing both name and email"),
+    ];
+
+    for (invalid_body, error_message) in test_cases {
+        // Act
+        let response = client
+            .post(&format!("{}/subscriptions", &app.address))
+            .header("Content-type", "application/x-www-form-urlencoded")
+            .body(invalid_body)
+            .send()
+            .await
+            .expect("Failed to execute request.");
+
+        // Assert
+        assert_eq!(
+            400,
+            response.status().as_u16(),
+            // Additional customised error message on test failure
+            "The API did not fail with 400 Bad Request when the payload was {}.",
+            error_message
+        );
+    }
+}
+```
+
+修改完成运行 `cargo test` 成功，让我们再运行一次 `cargo test`
+
+```sh
+running 3 tests
+test subscribe_returns_a_200_for_valid_from_data ... FAILED
+test subscribe_returns_a_400_when_data_is_missing ... ok
+test health_check_works ... ok
+
+failures:
+
+---- subscribe_returns_a_200_for_valid_from_data stdout ----
+Failed to execute query Database(PgDatabaseError { severity: Error, code: "23505", message: "重复键违反唯一约束\"subscriptions_email_key\"", detail: Some("键值\"(email)=(ursula_le_guin@gmail.com)\" 已经存在"), hint: None, position: None, where: None, schema: Some("public"), table: Some("subscriptions"), column: None, data_type: None, constraint: Some("subscriptions_email_key"), file: Some("nbtinsert.c"), line: Some(670), routine: Some("_bt_check_unique") })
+thread 'subscribe_returns_a_200_for_valid_from_data' panicked at 'assertion failed: `(left == right)`
+  left: `200`,
+ right: `500`', tests\health_check.rs:70:5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 
+failures:
+    subscribe_returns_a_200_for_valid_from_data
 
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+```
+
+### 测试隔离
+
+数据库是全局的，你的所有测试都在与它交互，无论他们留下什么，都会在后续测试中使用。正如我们第一次运行时注册了一个新用户，并将 ursula_le_guin@gmail.com 作为它的电子邮件，保存到了数据库，当我们重新运行测试时，再次尝试使用同一个电子邮件执行 INSERT 插入，会报错，因为我们违反了对电子邮件的 UNIQUE 约束，返回了一个 500 INTERNAL_SERVER_ERROR 错误。
+
+有两种方法可以确保在测试中与关系数据库交互时的测试隔离
+
+- 将整个测试包在一个 SQL 事务中，并在结束后回滚。
+- 为每个集成测试建立一个全新的逻辑数据库
+
+第一种方法很好，通常会更快。回滚一个 SQL 事务的时间比新建一个逻辑数据库更快。当为你的查询编写单元测试时，它的效果很好，但是在像我们这样的集成测试中却很难做到，我们的应用程序将从 `PgPool` 中借用一个 `PgConnection`，而我们没有办法在 SQL 事务环境中“捕获”该连接。使用第二个选择，可能会更慢，但更容易实现，那应该如何实现呢？
+
+在每次测试运行之前，我们要：
+
+- 创建一个具有唯一名称的新逻辑数据库
+- 在它上面运行数据库迁移
+
+在运行我们的 `actix-web` 测试程序之前，最好的位置是在 `spawn_app` 中处理上述过程，让我们再看一下
+
+```rust
+//! tests/health_check.rs
+
+use sqlx::PgPool;
+use std::net::TcpListener;
+use zero2prod::{configuration::get_configuration, startup::run};
+
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: PgPool,
+}
+
+// The function is asynchronous now!
+async fn spawn_app() -> TestApp {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind random port");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("http://127.0.0.1:{}", port);
+
+    let configuration = get_configuration().expect("Failed to read configuration");
+    let connection_pool = PgPool::connect(&configuration.database.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+
+    let server = run(listener, connection_pool.clone()).expect("Failed to bind address");
+    let _ = tokio::spawn(server);
+    TestApp {
+        address,
+        db_pool: connection_pool,
+    }
+}
+
+// [...]
+```
+
+`config.database.connection_string()` 使用的是我们在 `configuration.yaml` 配置文件中设置的 `database_name`，所有的测试都使用这同一个数据库。让我们使用随机的数据库
+
+```rust
+//! tests/health_check.rs
+
+use sqlx::PgPool;
+use uuid::Uuid;
+use std::net::TcpListener;
+use zero2prod::{configuration::get_configuration, startup::run};
+
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: PgPool,
+}
+
+// The function is asynchronous now!
+async fn spawn_app() -> TestApp {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind random port");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("http://127.0.0.1:{}", port);
+
+    let mut configuration = get_configuration().expect("Failed to read configuration");
+    configuration.database.database_name = Uuid::new_v4().to_string();
+    let connection_pool = PgPool::connect(&configuration.database.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+
+    let server = run(listener, connection_pool.clone()).expect("Failed to bind address");
+    let _ = tokio::spawn(server);
+    TestApp {
+        address,
+        db_pool: connection_pool,
+    }
+}
+// [...]
+```
+
+`cargo test` 运行失败，数据库无法与我们生成的名称进行连接。让我们将 `connection_string_without_db` 方法添加到我们的数据库设置中：
+
+```rust
+//! src/configuration.rs
+
+use std::fmt::format;
+#[derive(serde::Deserialize)]
+pub struct Settings {
+    pub database: DatabaseSettings,
+    pub application_port: u16,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DatabaseSettings {
+    pub username: String,
+    pub password: String,
+    pub port: u16,
+    pub host: String,
+    pub database_name: String,
+}
+
+impl DatabaseSettings {
+    pub fn connection_string(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.username, self.password, self.host, self.port, self.database_name
+        )
+    }
+
+    pub fn connection_string_without_db(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}",
+            self.username, self.password, self.host, self.port
+        )
+    }
+}
+
+pub fn get_configuration() -> Result<Settings, config::ConfigError> {
+    let settings = config::Config::builder()
+        .add_source(config::File::with_name("configuration"))
+        .build()?;
+
+    settings.try_deserialize()
+}
+```
+
+省略了 `database_name`，我们连接到 Postgres 实例，而不是一个特定的数据库。我们现在可以使用这个连接来创建我们需要的测试数据库，并在其上运行迁移程序
+
+```rust
+//! tests/health_check.rs
+
+use sqlx::{Connection, Executor, PgConnection, PgPool};
+use std::net::TcpListener;
+use uuid::Uuid;
+use zero2prod::{
+    configuration::{get_configuration, DatabaseSettings},
+    startup::run,
+};
+
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: PgPool,
+}
+
+// The function is asynchronous now!
+async fn spawn_app() -> TestApp {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind random port");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("http://127.0.0.1:{}", port);
+
+    let mut configuration = get_configuration().expect("Failed to read configuration");
+    configuration.database.database_name = Uuid::new_v4().to_string();
+    let connection_pool = configure_database(&configuration.database).await;
+
+    let server = run(listener, connection_pool.clone()).expect("Failed to bind address");
+    let _ = tokio::spawn(server);
+    TestApp {
+        address,
+        db_pool: connection_pool,
+    }
+}
+
+pub async fn configure_database(config: &DatabaseSettings) -> PgPool {
+    // Create database
+    let mut connection = PgConnection::connect(&config.connection_string_without_db())
+        .await
+        .expect("Failed to connect to Postgres");
+    connection
+        .execute(format!(r#"CREATE DATABASE "{}";"#, config.database_name).as_str())
+        .await
+        .expect("Failed to create database");
+
+    // Migrate database
+    let connection_pool = PgPool::connect(&config.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+    sqlx::migrate!("./migrations")
+        .run(&connection_pool)
+        .await
+        .expect("Failed to migrate database");
+
+    connection_pool
+}
+
+// `tokio::test` is the testing equivalent of `tokio::main`.
+// It also spares you from having to specify the `#[test]` attribute.
+//
+// You can inspect what code gets generated using
+// `cargo expand --test health_check` (<- name of the test file)
+#[tokio::test]
+async fn health_check_works() {
+    let app = spawn_app().await;
+    // We need to bring in `reqwest`
+    // to perform HTTP requests against our application.
+    let client = reqwest::Client::new();
+    // Act
+    let response = client
+        .get(&format!("{}/health_check", &app.address))
+        .send()
+        .await
+        .expect("Failed to execute request.");
+    // Assert
+    assert!(response.status().is_success());
+    assert_eq!(Some(0), response.content_length());
+}
+
+#[tokio::test]
+async fn subscribe_returns_a_200_for_valid_form_data() {
+    // Arrange
+    let app = spawn_app().await;
+    let client = reqwest::Client::new();
+
+    // Act
+    let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
+    let response = client
+        .post(&format!("{}/subscriptions", &app.address))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to execute request.");
+
+    // Assert
+    assert_eq!(200, response.status().as_u16());
+
+    let saved = sqlx::query!("SELECT email, name FROM subscriptions",)
+        .fetch_one(&app.db_pool)
+        .await
+        .expect("Failed to fetch saved subscription.");
+
+    assert_eq!(saved.email, "ursula_le_guin@gmail.com");
+    assert_eq!(saved.name, "le guin");
+}
+
+#[tokio::test]
+async fn subscribe_returns_a_400_when_data_is_missing() {
+    // Arrange
+    let app = spawn_app().await;
+    let client = reqwest::Client::new();
+    let test_cases = vec![
+        ("name=le%20guin", "missing the email"),
+        ("email=ursula_le_guin%40gmail.com", "missing the name"),
+        ("", "missing both name and email"),
+    ];
+
+    for (invalid_body, error_message) in test_cases {
+        // Act
+        let response = client
+            .post(&format!("{}/subscriptions", &app.address))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(invalid_body)
+            .send()
+            .await
+            .expect("Failed to execute request.");
+
+        // Assert
+        assert_eq!(
+            400,
+            response.status().as_u16(),
+            // Additional customised error message on test failure
+            "The API did not fail with 400 Bad Request when the payload was {}.",
+            error_message
+        );
+    }
+}
+```
+
+`sqlx::migrate!` 宏与运行 `slqx-cli` 执行 `sqlx migrate run` 时使用的宏相同。不需要将 `bash` 脚本混合使用就可以获得相同的结果。
+
+让我们再次运行 `cargo test` 成功，并且没有关闭连接，在测试结束时没有执行任何清理步骤 -- 我们创建的逻辑数据不会被删除。这是有意的，我们可以添加一个清理步骤，但是我们的 Postgres 实例仅仅用于测试目的，如果在数百次测试运行时，由于大量的（几乎是空的）数据库，性能开始下降。
+
+## 总结
+
+在这一章，涵盖了大量的主题： `actix-web` 的 `extrator` 提取器和 `HTML form` 表单，Rust 生态系统中可用的数据库，和 `sqlx` 的基础只是，以及在处理数据库时确保测试隔离的基本技术。
 
