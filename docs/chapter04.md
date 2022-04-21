@@ -1,3 +1,31 @@
+- [1.  Unkonwn Unkonwns](#1--unkonwn-unkonwns)
+- [2. 可观测性](#2-可观测性)
+- [3. Logging 日志记录](#3-logging-日志记录)
+  - [3.1 The `log` Crate](#31-the-log-crate)
+  - [3.2 `actix-web` 的 `Logger Middleware`](#32-actix-web-的-logger-middleware)
+  - [3.3 The Facade Patter](#33-the-facade-patter)
+- [4. Instrumenting POST /subscriptions](#4-instrumenting-post-subscriptions)
+  - [4.1  Interactions With External Systems](#41--interactions-with-external-systems)
+  - [4.2 Think Like A User](#42-think-like-a-user)
+  - [4.3 Logs Must Be Easy To Correlate](#43-logs-must-be-easy-to-correlate)
+- [5. 结构化日志](#5-结构化日志)
+  - [5.1 `tracing crate`](#51-tracing-crate)
+  - [5.2 Migrating From log To tracing](#52-migrating-from-log-to-tracing)
+  - [5.3 tracing’s Span](#53-tracings-span)
+  - [5.4 Instrumenting Futures](#54-instrumenting-futures)
+  - [5.5  tracing’s Subscriber](#55--tracings-subscriber)
+  - [5.6 tracing-subscriber](#56-tracing-subscriber)
+  - [5.7 tracing-bunyan-formatter](#57-tracing-bunyan-formatter)
+  - [5.8 tracing-log](#58-tracing-log)
+  - [5.9 Removing Unused Dependencies](#59-removing-unused-dependencies)
+  - [5.10  Cleaning Up Initialisation](#510--cleaning-up-initialisation)
+  - [5.11 Logs For Integration Tests](#511-logs-for-integration-tests)
+  - [5.12 Cleaning Up Instrumentation Code - tracing::instrument](#512-cleaning-up-instrumentation-code---tracinginstrument)
+  - [5.13  Protect Your Secrets - secrecy](#513--protect-your-secrets---secrecy)
+  - [5.14  Request Id](#514--request-id)
+  - [5.15    Leveraging The tracing Ecosystem](#515----leveraging-the-tracing-ecosystem)
+- [6. 总结](#6-总结)
+
 在第3章中，我们完成了 `PUT /subscriptions`，以实现项目的第一个用户故事：
 
 > As a blog visitor, 
@@ -1709,17 +1737,411 @@ pub async fn subscribe(form: web::Form<FormData>, pool: web::Data<PgPool>) -> Ht
 **tracing** 用它的 **tracing::instrument procedural macro** 来满足这个特殊的使用情况。让我们看看它的作用。
 
 ```rust
+//! src/routes/subscriptions.rs
+use actix_web::{web, HttpResponse};
+use chrono::Utc;
+use sqlx::PgPool;
+use tracing::Instrument;
+use uuid::Uuid;
+
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+#[tracing::instrument(
+    name = "Adding a new subscriber",
+    skip(form, pool),
+    fields(
+        request_id = %Uuid::new_v4(),
+        subscriber_email = %form.email,
+        subscriber_name = %form.name,
+    )
+)]
+pub async fn subscribe(form: web::Form<FormData>, pool: web::Data<PgPool>) -> HttpResponse {
+    let query_span = tracing::info_span!("Saving new subscriber details in the database");
+
+    match sqlx::query!(
+        r#"
+        INSERT INTO subscriptions (id, email, name, subscribed_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+        Uuid::new_v4(),
+        form.email,
+        form.name,
+        Utc::now()
+    )
+    .execute(pool.as_ref())
+    // First we attach the instrumentation, then we `.await` it
+    .instrument(query_span)
+    .await
+    {
+        Ok(_) => HttpResponse::Ok().finish(),
+        Err(e) => {
+            // Yes, this error log falls outside of `query_span`
+            // We'll rectify it later, pinky swear!
+            tracing::error!("Failed to execute query {e:?}");
+            HttpResponse::InternalServerError().finish()
+        }
+    }
+
+    // `_request_span_guard` is dropped at the end of `subscribe`
+    // That's when we "exit" the span
+}
 ```
 
+`#[tracing::instrument]` 在函数调用开始时创建一个 **span**，并自动将传递给函数的所有参数附加到 **span** 的上下文中--在我们的例子中，**form** 和 **pool**。通常情况下，函数参数不会在日志记录中显示（比如**pool**），或者我们想更明确地指定应该/如何捕获它们（比如命名 **form** 的每个字段）--我们可以明确地告诉 **tracing** 使用 **skip** 来忽略它们。
 
+**name** 可以用来指定与函数跨度 **span** 相关的信息--如果省略，则默认为函数名称。 我们还可以使用字段 **fields** 指令来丰富 **span** 的上下文。它利用了我们已经见过的 **info_span！** 宏的相同语法 。
+结果是相当不错的：所有的工具化关注点都被执行关注点直观地分开。 - 前者在程序性宏中处理，"装饰 "了函数声明，而函数主体则侧重于实际的业务逻辑。 
+需要指出的是，**tracing::instrument** 也要注意使用 **Instrument::instrument** 如果它被应用于一个异步函数。 
+让我们在自己的函数中提取 **query**，并使用 **tracing::instrument** 来摆脱 **query_span**。 以及对 **.instrument** 方法的调用
 
-### 5.13
+```rust
+//! src/routes/subscriptions.rs
+use actix_web::{web, HttpResponse};
+use chrono::Utc;
+use sqlx::PgPool;
+use uuid::Uuid;
 
-### 5.14
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
 
-### 5.15
+#[tracing::instrument(
+    name = "Adding a new subscriber",
+    skip(form, pool),
+    fields(
+        request_id = %Uuid::new_v4(),
+        subscriber_email = %form.email,
+        subscriber_name = %form.name,
+    )
+)]
+
+pub async fn subscribe(form: web::Form<FormData>, pool: web::Data<PgPool>) -> HttpResponse {
+    match insert_subscriber(&pool, &form).await {
+        Ok(_) => HttpResponse::Ok().finish(),
+        Err(_) => HttpResponse::InternalServerError().finish(),
+    }
+}
+
+#[tracing::instrument(
+    name = "Saving new subscriber details in the database",
+    skip(form, pool)
+)]
+pub async fn insert_subscriber(pool: &PgPool, form: &FormData) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        r#"
+        INSERT INTO subscriptions (id, email, name, subscribed_at)
+        VALUES ($1, $2, $3, $4)
+        "#,
+        Uuid::new_v4(),
+        form.email,
+        form.name,
+        Utc::now()
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to execute query: {e:?}");
+        e
+        // Using the `?` operator to return early
+        // if the function failed, returning a sqlx::Error
+        // We will talk about error handling in depth later!
+    })?;
+    Ok(())
+}
+```
+
+现在错误事件确实属于查询范围，我们有了更好的分离。 
+
+- **insert_subscriber** 负责数据库逻辑，它对周围的Web框架没有任何交互--也就是说，我们没有把 **web::Form** 或 **web::Data** 包装器作为输入类型传递。 
+- **subscribe** 通过调用所需的例程来协调要做的工作，并根据 **HTTP** 协议的规则和惯例将其结果转化为适当的响应。 
+
+我必须承认我对 **tracing::instrument** 无限的热爱：它大大降低了对你的代码进行检测的工作量。 它把你推到 **pit of success**：简单而且正确。
+
+### 5.13  Protect Your Secrets - secrecy
+
+实际上 **#[tracing::instrument]** 有一个元素我并不喜欢：它自动将传递给函数的所有参数附加到 **span** 的上下文中--你必须选择退出 **opt-out** 记录函数输入（通过 **skip**）而不是选择进入 **opt-in**。
+你不希望在你的日志中出现秘密（如密码）或个人身份信息（如终端用户的账单地址）。 
+**Opt-out** 是一个危险的默认值--每当你使用 **#[tracing::instrument]** 向一个函数添加一个新的输入时， 你都需要问自己：记录这个是否安全？ 我应该跳过它吗？ 
+在未来有人可能会忘记 - 你现在有一个安全事件要处理。 你可以通过引入一个明确 **explicitly** 标记哪些字段被认为是敏感字段的-- 使用 **secrecy::Secret** 来防止这种情况发生。
+
+```toml
+#! Cargo.toml
+# [...]
+[dependencies]
+secrecy = { version = "0.8", features = ["serde"] }
+# [...]
+```
+
+让我们来看看它的定义。  
+
+```rust
+/// Wrapper type for values that contains secrets, which attempts to limit
+/// accidental exposure and ensure secrets are wiped from memory when dropped.
+/// (e.g. passwords, cryptographic keys, access tokens or other credentials)
+///
+/// Access to the secret inner value occurs through the [...]
+/// `expose_secret()` method [...]
+pub struct Secret<S>
+    where
+    	S: Zeroize,
+{
+    /// Inner secret value
+    inner_secret: S,
+}
+```
+
+由归零特性提供的记忆清除是一个不错的选择。Memory wiping, provided by the **Zeroize trait**, is a nice-to-have.
+
+我们正在寻找的关键属性是 **Secret ** 的屏蔽 **Debug** 实现：`println!("{:?}", my_secret_string) ` 输出 `Secret([REDACTED String]) ` 而不是实际的秘密值 。这正是我们需要的，以防止通过 `#[tracing::instrument]` 或其他日志语句意外泄漏敏感材料。 
+明确的封装类型还有一个额外的好处：它可以作为新的开发人员被引入代码库的文件。在你的领域里/根据相关规定，它可以确定什么是敏感的。
+现在，我们唯一需要担心的秘密是数据库密码。让我们把它修改一下。 
+
+```rust
+//! src/configuration.rs
+use secrecy::Secret;
+// [..]
+
+#[derive(serde::Deserialize)]
+pub struct DatabaseSettings {
+	// [...]
+	pub password: Secret<String>,
+}
+```
+
+**Secret** 不干涉反序列化 - **Secret** 通过委托给包装类型的反序列化逻辑来实现 **serde::Deserialize**（如果你像我们一样启用 **serde** 特性标志）。此时编译器会报错。
+
+```bash
+error[E0277]: `Secret<std::string::String>` doesn't implement `std::fmt::Display`
+--> src/configuration.rs:29:28
+|
+| 			self.username, self.password, self.host, self.port
+| 							^^^^^^^^^^^^^
+| `Secret<std::string::String>` cannot be formatted with the default formatter
+```
+
+这是一个特性，而不是一个错误-- **secret::Secret** 没有实现 **Display**，因此我们需要明确地允许暴露 **wrapped secret**。编译器错误是一个很好的提示，让我们注意到整个数据库连接字符串也应该被标记为 **Secret**，因为它嵌入了数据库密码。
+
+```rust
+//! src/configuration.rs
+use secrecy::ExposeSecret;
+use secrecy::Secret;
+
+#[derive(serde::Deserialize)]
+pub struct Settings {
+    pub database: DatabaseSettings,
+    pub application_port: u16,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DatabaseSettings {
+    pub username: String,
+    pub password: Secret<String>,
+    pub port: u16,
+    pub host: String,
+    pub database_name: String,
+}
+
+impl DatabaseSettings {
+    pub fn connection_string(&self) -> Secret<String> {
+        Secret::new(format!(
+            "postgres://{}:{}@{}:{}/{}",
+            self.username,
+            self.password.expose_secret(),
+            self.host,
+            self.port,
+            self.database_name
+        ))
+    }
+
+    pub fn connection_string_without_db(&self) -> Secret<String> {
+        Secret::new(format!(
+            "postgres://{}:{}@{}:{}",
+            self.username,
+            self.password.expose_secret(),
+            self.host,
+            self.port
+        ))
+    }
+}
+
+pub fn get_configuration() -> Result<Settings, config::ConfigError> {
+    let settings = config::Config::builder()
+        .add_source(config::File::with_name("configuration"))
+        .build()?;
+
+    settings.try_deserialize()
+}
+```
+
+```rust
+//! src/main.rs
+use secrecy::ExposeSecret;
+// [...]
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    // [...]
+    let connection_pool =
+        PgPool::connect(&configuration.database.connection_string().expose_secret())
+            .await
+            .expect("Failed to connect to Postgres.");
+    // [...]
+}	
+```
+
+```rust
+//! tests/health_check.rs
+use secrecy::ExposeSecret;
+// [...]
+
+pub async fn configure_database(config: &DatabaseSettings) -> PgPool {
+    let mut connection =
+        PgConnection::connect(&config.connection_string_without_db().expose_secret())
+            .await
+            .expect("Failed to connect to Postgres");
+    // [...]
+    let connection_pool = PgPool::connect(&config.connection_string().expose_secret())
+        .await
+        .expect("Failed to connect to Postgres.");
+    // [...]
+}
+```
+
+这就是目前的情况--今后我们会将更多敏感信息放入 **Secret**。
+
+### 5.14  Request Id
+
+我们还有最后一项工作要做：确保某个特定请求的所有日志，特别是有返回状态码的记录，都有一个 **request_id** 属性来充实。怎么做？ 
+如果我们的目标是避免使用 **actix_web::Logger**，最简单的解决方案是添加另一个中间件。 **RequestIdMiddleware**，来负责。 
+
+- 产生一个独特的请求标识符。 
+- 创建一个新的跨度，并将请求标识符作为上下文。 
+- 将中间件链的其余部分包裹在新创建的跨度中。 
+
+不过我们会留下很多东西：**actix_web::Logger** 并不能让我们以与其他日志相同的结构化 **JSON** 格式访问其丰富的信息（状态代码、处理时间、调用者IP等）-- 我们必须从其消息字符串中解析出所有这些信息。在这种情况下，我们最好是引入一个可追踪的解决方案。 让我们把 **tracing-actix-web** 作为我们的一个依赖项。
+
+```toml
+#! Cargo.toml
+# [...]
+[dependencies]
+tracing-actix-web = "0.5"
+# [...]
+```
+
+它是作为 **actix-web** 的 **Logger** 的直接替代品而设计的，只是基于 **tracing** 而不是 **log**。
+
+```rust
+//! src/startup.rs
+use actix_web::dev::Server;
+use actix_web::web::Data;
+use actix_web::{web, App, HttpServer};
+use sqlx::PgPool;
+use std::net::TcpListener;
+use tracing_actix_web::TracingLogger;
+
+use crate::routes::{health_check, subscribe};
+
+pub fn run(listener: TcpListener, db_pool: PgPool) -> Result<Server, std::io::Error> {
+    let db_pool = Data::new(db_pool);
+    let server = HttpServer::new(move || {
+        App::new()
+            // Instead of `Logger::default`
+            .wrap(TracingLogger::default())
+            .route("/health_check", web::get().to(health_check))
+            .route("/subscriptions", web::post().to(subscribe))
+            .app_data(db_pool.clone())
+    })
+    .listen(listener)?
+    .run();
+    Ok(server)
+}
+```
+
+如果你启动应用程序并发出一个请求，你应该在所有的日志上看到一个 **request_id**，以及 **request_path** 和其他一些有用的信息。 
+我们几乎已经完成了--有一个悬而未决的问题需要我们去处理。 让我们仔细看看 **POST /subscriptions** 请求所发出的日志记录。 
+
+```shell
+{
+    "msg": "[REQUEST - START]",
+    "request_id": "21fec996-ace2-4000-b301-263e319a04c5",
+    ...
+}
+{
+    "msg": "[ADDING A NEW SUBSCRIBER - START]",
+    "request_id":"aaccef45-5a13-4693-9a69-5",
+    ...
+}
+```
+
+对于同一个请求，我们有两个不同的 **request_id**! 这个错误可以追溯到我们的订阅函数上的 `#[tracing::instrument]` 注释。 
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+
+#[tracing::instrument(
+    name = "Adding a new subscriber",
+    skip(form, pool),
+    fields(
+        request_id = %Uuid::new_v4(),
+        subscriber_email = %form.email,
+        subscriber_name= %form.name
+    )
+)]
+pub async fn subscribe(
+    form: web::Form<FormData>,
+    pool: web::Data<PgPool>,
+) -> HttpResponse {
+    // [...]
+}
+// [...]
+
+```
+
+我们仍然在函数级生成一个 `request_id`，它覆盖了来自`TracingLogger` 的 **request_id**。
+
+让我们来修复这个问题
+
+```rust
+//! src/routes/subscriptions.rs
+// [...]
+#[tracing::instrument(
+    name = "Adding a new subscriber",
+    skip(form, pool),
+    fields(
+        subscriber_email = %form.email,
+        subscriber_name= %form.name
+    )
+)]
+pub async fn subscribe(
+    form: web::Form<FormData>,
+    pool: web::Data<PgPool>,
+) -> HttpResponse {
+	// [...]
+}
+// [...]
+```
+
+现在一切都好了--我们的应用程序的每个端点都有一个一致的 **request_id**。
+
+### 5.15    Leveraging The tracing Ecosystem
+
+我们涵盖了 **tracing** 所能提供的很多东西--它大大改善了我们正在收集的遥测数据的质量，以及我们的 **instrumentation** 代码的清晰度。 
+同时，当涉及到用户层时，我们几乎没有触及到整个 **tracing** 生态系统的丰富性。 
+仅仅再提几个现成的例子。 
+
+**tracing-actix-web** 是与 **OpenTelemetry**兼容的。 如果你插入 [**tracing-opentelemetry**](https://docs.rs/tracing-opentelemetry)，你可以将 **span** 运送到与[**OpenTelemetry**](https://opentelemetry.io/) 兼容的服务（例如 [`Jaeger`](https://www.jaegertracing.io/) 或 [`Honeycomb.io`](https://honeycomb.io/)）进行进一步分析。 
+
+[`tracing-error`](https://docs.rs/tracing-error) 用 [`SpanTrace`](https://docs.rs/tracing-error/latest/tracing_error/struct.SpanTrace.html) 丰富了我们的错误类型，以方便故障排除。
+
+毫不夸张地说，**tracing** 是Rust生态系统中的一个基础板块。虽然日志是最小的共同点，但 **tracing** 现在已经被确立为整个诊断和基础设施生态系统的重要组成部分了。 
 
 ## 6. 总结
 
-
+我们从一个完全很小的 **actix-web** 应用程序开始，最终获得了高质量的远程测试数据。现在是时候把这个 **newsletter API** 投入使用了! 在下一章，我们将为我们的Rust项目建立一个基本的 **deployment pipeline**。
 
